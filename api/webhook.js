@@ -348,8 +348,10 @@ export async function POST(request) {
   const sigBuf = Buffer.from(sig);
   const expBuf = Buffer.from(expected);
   if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    console.error(`[Webhook] 簽章驗證失敗！請確認 LINE_CHANNEL_SECRET。預期開頭: ${expected.slice(0, 8)}, 實際收到: ${sig.slice(0, 8)}`);
     return new Response('bad signature', { status: 403 });
   }
+  console.log('[Webhook] 簽章驗證成功，開始解析事件...');
 
   let body;
   try {

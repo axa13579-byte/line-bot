@@ -40,6 +40,7 @@ app.get('/api/webhook', async (req, res) => {
 
 // Webhook 事件接收路由 (POST)
 app.post('/api/webhook', async (req, res) => {
+  console.log(`[Webhook] 收到來自 LINE 的 POST 請求，長度: ${req.body?.length || 0}`);
   try {
     // 將 Express 的 Request 轉換成 Web API 標準的 Request
     const headers = new Headers();
