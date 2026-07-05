@@ -127,12 +127,15 @@ async function fetchWithTimeout(url, options, ms) {
   }
 }
 
-async function lineReply(replyToken, text) {
+async function lineReply(replyToken, payload) {
+  const messages = typeof payload === 'string'
+    ? [{ type: 'text', text: payload.slice(0, 4900) }]
+    : payload.slice(0, 5);
   const res = await fetchWithTimeout('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_TOKEN}` },
-    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text: text.slice(0, 4900) }] }),
-  }, 8000);
+    body: JSON.stringify({ replyToken, messages }),
+  }, 10000);
   let body = '';
   if (!res.ok) {
     body = (await res.text().catch(() => '')).slice(0, 200);
@@ -140,6 +143,18 @@ async function lineReply(replyToken, text) {
   }
   return { status: res.status, body };
 }
+
+// 混合模式：優先使用免費的 replyToken，失敗（如過期）則退水至扣額度的 push
+async function lineReplyOrPush(replyToken, userId, payload) {
+  const res = await lineReply(replyToken, payload);
+  if (res.status === 200) return res;
+  console.warn(`lineReply failed or expired (${res.status}), trying linePush fallback...`);
+  if (userId) {
+    return await linePush(userId, payload);
+  }
+  return res;
+}
+
 
 // 推播：不受 reply token 30 秒時效限制，判讀多久都送得到（吃免費訊息額度，量小可接受）
 async function linePush(to, payload) {
@@ -269,10 +284,6 @@ async function handleEvent(ev) {
   // 處理圖片、PDF 檔案、文字（含連結）；其餘略過
   if (message.type !== 'image' && message.type !== 'text' && message.type !== 'file') return;
 
-  // 先用 reply token 給即時反饋（此刻一定有效）；答案改用 push（不受 30 秒時效限制）
-  // 注意 reply token 只能用一次，用在這裡後，最終答案務必走 linePush
-  await lineReply(replyToken, '📸 收到！判讀中，大約 20～40 秒後給你完整處理包，稍等一下 🙌');
-
   const DOC_LABEL = '這是夥伴傳來的照會單，請產出處理包 JSON。';
   let content;
   let imageBuf = null;
@@ -285,7 +296,7 @@ async function handleEvent(ev) {
       // 照會常以 PDF 檔傳來
       const f = await getLineFile(message.id);
       if (f.mediaType !== 'application/pdf') {
-        await linePush(userId, '我目前看得懂「PDF 檔」或「照片」的照會，這個檔案格式我讀不了，麻煩改傳 PDF 或直接拍照給我 🙏');
+        await lineReplyOrPush(replyToken, userId, '我目前看得懂「PDF 檔」或「照片」的照會，這個檔案格式我讀不了，麻煩改傳 PDF 或直接拍照給我 🙏');
         await tgNotify(`ℹ️ 照會小幫手收到非PDF檔（${f.mediaType || '未知'}），已請夥伴改傳`);
         return;
       }
@@ -299,7 +310,7 @@ async function handleEvent(ev) {
         if (fetched) {
           content = bufferToContent(fetched.buf, fetched.mediaType, '這是夥伴傳來的照會下載連結內容，請產出處理包 JSON。');
         } else {
-          await linePush(userId, '這個連結我開不了（可能需要登入或已過期）。麻煩你點開連結、把照會 PDF 下載後直接傳檔案給我，或截圖傳給我都行 🙏');
+          await lineReplyOrPush(replyToken, userId, '這個連結我開不了（可能需要登入或已過期）。麻煩你點開連結、把照會 PDF 下載後直接傳檔案給我，或截圖傳給我都行 🙏');
           await tgNotify('ℹ️ 照會小幫手：連結無法自動抓取，已請夥伴改傳PDF/截圖');
           return;
         }
@@ -313,14 +324,14 @@ async function handleEvent(ev) {
       const { links, missing } = matchForms(out.company, out.docs);
       const messages = [{ type: 'text', text: out.reply.slice(0, 4900) }];
       if (links.length || missing.length) messages.push(formsFlex(links, missing));
-      await linePush(userId, messages);
+      await lineReplyOrPush(replyToken, userId, messages);
       await tgNotify(`📥 照會小幫手已回覆\n${out.company || '?'}｜${out.type || '?'}｜信心${out.confidence}\ntags: ${(out.tags || []).join(' ')}\n📎 附表單 ${links.length} 份${missing.length ? `／缺 ${missing.length}` : ''}`);
     } else {
-      await linePush(userId, '這張比較特殊，我已經轉給主管確認，答案回來馬上告訴你 💪');
+      await lineReplyOrPush(replyToken, userId, '這張比較特殊，我已經轉給主管確認，答案回來馬上告訴你 💪');
       await tgNotify(`🔴 照會難案（信心${out.confidence}）待主管回答\n初步判讀：${out.company || '?'}｜${out.type || '?'}\n\nAI草稿：\n${(out.reply || '').slice(0, 800)}`, imageBuf);
     }
   } catch (err) {
-    await linePush(userId, '這張我判讀時卡住了，已經轉給主管看，稍等一下 🙏');
+    await lineReplyOrPush(replyToken, userId, '這張我判讀時卡住了，已經轉給主管看，稍等一下 🙏');
     await tgNotify(`⚠️ 照會小幫手處理失敗：${String(err).slice(0, 200)}`, imageBuf);
   }
 }
