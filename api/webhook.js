@@ -4,6 +4,8 @@
 import crypto from 'node:crypto';
 import { SYSTEM_PROMPT } from './_prompt.js';
 import { FORMS } from './_forms.js';
+import { handleHealthEvent, isLikelyHealthResponse } from './_health.js';
+import { checkCompleted, acquireProcessingLock, setCompleted, releaseProcessingLock } from './_redis.js';
 
 export const config = { maxDuration: 60 };
 
@@ -276,33 +278,100 @@ async function tgNotify(text, imageBuf) {
   }
 }
 
+// 輔助函數：取得 LINE 事件唯一識別，若無 webhookEventId 則以雜湊代替
+function getEventId(ev) {
+  if (ev.webhookEventId) return ev.webhookEventId;
+  const userId = ev.source?.userId || 'unknown_user';
+  const timestamp = ev.timestamp || Date.now();
+  const detail = ev.message?.id || ev.type || 'unknown_type';
+  return crypto.createHash('sha256').update(`${userId}:${timestamp}:${detail}`).digest('hex');
+}
+
 async function handleEvent(ev) {
   if (ev.type !== 'message') return;
   const { replyToken, message } = ev;
   const userId = ev.source?.userId;
 
-  // 處理圖片、PDF 檔案、文字（含連結）；其餘略過
-  if (message.type !== 'image' && message.type !== 'text' && message.type !== 'file') return;
+  // 1. 取得並計算 Event ID
+  const eventId = getEventId(ev);
+  const isTextMsg = message.type === 'text';
+  const isHealthCmd = isTextMsg && (
+    ['健康紀錄', '記錄健康', '記錄血壓', '記錄體重', '血壓', '體重', '健康紀錄選單', '新增健康紀錄', '最近紀錄', '本月摘要', '取消'].includes(message.text.trim()) ||
+    message.text.trim().startsWith('健康') ||
+    isLikelyHealthResponse(message.text)
+  );
 
-  const DOC_LABEL = '這是夥伴傳來的照會單，請產出處理包 JSON。';
-  let content;
+  // 2. 進行兩階段去重與並行鎖定檢查
+  let gotLock = false;
+  try {
+    // A. 檢查 completed 狀態
+    const isCompleted = await checkCompleted(eventId);
+    if (isCompleted) {
+      console.log(`[Deduplication] 事件 ${eventId} 已標記為完成，忽略本次重送。`);
+      return;
+    }
+
+    // B. 取得 processing 鎖 (避免並行)
+    gotLock = await acquireProcessingLock(eventId);
+    if (!gotLock) {
+      console.log(`[Deduplication] 事件 ${eventId} 正在被其他執行個體處理中，忽略本次並行請求。`);
+      return;
+    }
+  } catch (err) {
+    console.error('[Deduplication] Redis 兩階段去重檢查失敗:', err.message);
+    if (isHealthCmd) {
+      await lineReplyOrPush(replyToken, userId, '⚠️ 抱歉，系統連線暫時發生異常，目前無法記錄您的健康數據，請稍後再試 🙏');
+      return;
+    }
+    // 非健康紀錄則放行，不影響照會流程
+  }
+
+  // 3. 處理事件本體
+  let success = false;
   let imageBuf = null;
   try {
+    // 優先攔截並處理健康紀錄文字指令與狀態流程
+    if (message.type === 'text') {
+      try {
+        const healthRes = await handleHealthEvent(userId, message.text);
+        if (healthRes && healthRes.handled) {
+          if (healthRes.reply) {
+            await lineReplyOrPush(replyToken, userId, healthRes.reply);
+          }
+          success = true;
+          return;
+        }
+      } catch (err) {
+        console.error('handleHealthEvent error:', err);
+        if (isHealthCmd) {
+          await lineReplyOrPush(replyToken, userId, '⚠️ 抱歉，健康紀錄功能暫時發生錯誤，請稍後再試。');
+          return;
+        }
+        // 非健康紀錄則放行，讓原有照會流程處理
+      }
+    }
+
+    // 處理圖片、PDF 檔案、文字（含連結）；其餘略過
+    if (message.type !== 'image' && message.type !== 'text' && message.type !== 'file') return;
+
+    const DOC_LABEL = '這是夥伴傳來的照會單，請產出處理包 JSON。';
+    let content;
+    
     if (message.type === 'image') {
       const img = await getLineImage(message.id);
       imageBuf = img.buf;
       content = bufferToContent(img.buf, img.mediaType, DOC_LABEL);
     } else if (message.type === 'file') {
-      // 照會常以 PDF 檔傳來
       const f = await getLineFile(message.id);
       if (f.mediaType !== 'application/pdf') {
         await lineReplyOrPush(replyToken, userId, '我目前看得懂「PDF 檔」或「照片」的照會，這個檔案格式我讀不了，麻煩改傳 PDF 或直接拍照給我 🙏');
         await tgNotify(`ℹ️ 照會小幫手收到非PDF檔（${f.mediaType || '未知'}），已請夥伴改傳`);
+        success = true; // 此為預期業務流程終止，亦屬處理成功
         return;
       }
+      imageBuf = f.buf;
       content = bufferToContent(f.buf, 'application/pdf', DOC_LABEL);
     } else {
-      // 文字：若含連結，照會多為下載連結 → 自動抓 PDF/圖片來判讀
       const userText = String(message.text || '').slice(0, MAX_TEXT_LEN);
       const urlMatch = userText.match(/https?:\/\/[^\s]+/);
       if (urlMatch) {
@@ -312,6 +381,7 @@ async function handleEvent(ev) {
         } else {
           await lineReplyOrPush(replyToken, userId, '這個連結我開不了（可能需要登入或已過期）。麻煩你點開連結、把照會 PDF 下載後直接傳檔案給我，或截圖傳給我都行 🙏');
           await tgNotify('ℹ️ 照會小幫手：連結無法自動抓取，已請夥伴改傳PDF/截圖');
+          success = true;
           return;
         }
       } else {
@@ -330,9 +400,24 @@ async function handleEvent(ev) {
       await lineReplyOrPush(replyToken, userId, '這張比較特殊，我已經轉給主管確認，答案回來馬上告訴你 💪');
       await tgNotify(`🔴 照會難案（信心${out.confidence}）待主管回答\n初步判讀：${out.company || '?'}｜${out.type || '?'}\n\nAI草稿：\n${(out.reply || '').slice(0, 800)}`, imageBuf);
     }
+    
+    success = true;
   } catch (err) {
     await lineReplyOrPush(replyToken, userId, '這張我判讀時卡住了，已經轉給主管看，稍等一下 🙏');
     await tgNotify(`⚠️ 照會小幫手處理失敗：${String(err).slice(0, 200)}`, imageBuf);
+    throw err; // 向上拋出讓 POST 捕獲，保證 hasError 邏輯正常運作
+  } finally {
+    // 4. 兩階段去重收尾
+    if (gotLock) {
+      try {
+        if (success) {
+          await setCompleted(eventId);
+        }
+        await releaseProcessingLock(eventId);
+      } catch (err) {
+        console.error('[Deduplication] 釋放鎖或設定已完成狀態失敗:', err.message);
+      }
+    }
   }
 }
 

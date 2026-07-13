@@ -4,12 +4,20 @@
   "type": "module",
   "scripts": {
     "sync": "node tools/sync_knowledge.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "test:health": "node tools/test_health.js",
+    "test:integration": "node tools/test_integration.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "devDependencies": {
     "vercel": "^54.20.1"
   },
   "dependencies": {
     "express": "^5.2.1"
+  },
+  "overrides": {
+    "path-to-regexp": "8.4.0"
   }
 }

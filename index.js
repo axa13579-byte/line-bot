@@ -66,7 +66,7 @@ app.post('/api/webhook', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is running on port ${PORT}`);
-  console.log(`Webhook URL is ready at: http://localhost:${PORT}/api/webhook`);
+  console.log(`Webhook URL is ready at: http://0.0.0.0:${PORT}/api/webhook`);
 });
